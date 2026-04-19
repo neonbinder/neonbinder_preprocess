@@ -9,7 +9,7 @@ See `../image-processing.md` in the neonbinder wrapper for the full design.
 
 ## Endpoints
 
-- `GET /healthz` — liveness probe, returns `{"status":"ok"}`.
+- `GET /health` — liveness probe, returns `{"status":"ok"}`.
 - `POST /process` — already-cropped image → orient + classify (slice 1, in progress).
 - `POST /crop-and-process` — raw photo → SAM crop → orient + classify (slice 2).
 

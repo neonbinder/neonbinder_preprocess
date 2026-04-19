@@ -1,6 +1,6 @@
 """FastAPI entrypoint for the neonbinder-preprocess service.
 
-Slice 1 (current): `/healthz` + `/process`. `/process` accepts an already-
+Slice 1 (current): `/health` + `/process`. `/process` accepts an already-
 cropped card image, runs orient + classify, and returns structured card
 fields plus the CCW rotation that was applied before classification.
 
@@ -82,8 +82,8 @@ def _rotate_image_bytes(image_bytes: bytes, degrees_ccw: int) -> bytes:
         return out.getvalue()
 
 
-@app.get("/healthz")
-def healthz() -> dict[str, str]:
+@app.get("/health")
+def health() -> dict[str, str]:
     return {"status": "ok"}
 
 

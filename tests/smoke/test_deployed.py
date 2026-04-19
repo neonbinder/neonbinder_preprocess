@@ -75,8 +75,8 @@ def synthetic_card_image() -> bytes:
 
 
 class TestHealthz:
-    def test_healthz_returns_ok(self, client: httpx.Client) -> None:
-        response = client.get("/healthz")
+    def test_health_returns_ok(self, client: httpx.Client) -> None:
+        response = client.get("/health")
         assert response.status_code == 200, response.text
         assert response.json() == {"status": "ok"}
 

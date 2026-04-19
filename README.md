@@ -9,7 +9,7 @@ See `../image-processing.md` in the neonbinder wrapper for the full design.
 
 ## Endpoints
 
-- `GET /healthz` — liveness probe, returns `{"status":"ok"}`.
+- `GET /health` — liveness probe, returns `{"status":"ok"}`.
 - `POST /process` — already-cropped image → orient + classify (slice 1, in progress).
 - `POST /crop-and-process` — raw photo → SAM crop → orient + classify (slice 2).
 
@@ -28,26 +28,12 @@ ruff check .
 
 ## Deploy
 
-GitHub Actions (`.github/workflows/preprocess-deploy.yml`) deploys on push:
+Deploy jobs are **not yet wired up**. Once `neonbinder_browser` and
+`neonbinder_terraform` finish converting to trunk-based development with
+per-PR preview revisions, this repo's workflow will mirror the browser
+service's final shape (per-PR preview deploys to `neonbinder-dev`,
+merge-to-main deploys to `neonbinder` with a traffic-shift gate on smoke).
 
-- `develop` → `neonbinder-dev-io`
-- `main` → `neonbinder-484017`
-
-Both deploys tag the image in the shared Artifact Registry as
-`gcr.io/$GCP_PROJECT/neonbinder-preprocess:$SHA` and update the Cloud Run
-service via `google-github-actions/deploy-cloudrun@v2`. Runtime config
-(CPU, memory, secrets, SA) is managed by `../neonbinder_terraform/`; CI
-only updates the image tag.
-
-## First-deploy ordering
-
-Terraform needs a `:latest` image to reference on first apply. Bootstrap
-once manually per GCP project:
-
-```bash
-gcloud auth configure-docker --quiet
-docker build -t gcr.io/$GCP_PROJECT/neonbinder-preprocess:latest .
-docker push gcr.io/$GCP_PROJECT/neonbinder-preprocess:latest
-```
-
-Then run Terraform. Thereafter CI handles all image updates.
+The current `.github/workflows/preprocess-deploy.yml` only runs lint + unit
+tests on PRs and pushes. See `../neonbinder/we-have-a-new-kind-spindle.md`
+(Claude Code plan file) for the full intended delivery model.

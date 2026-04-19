@@ -62,6 +62,8 @@ def test_fixture_end_to_end(case: FixtureCase):
         "rotation_degrees",
         "orient_confidence",
         "text_count",
+        "cropped_source",
+        "cropped_image_b64",
     }, f"{case.name}: unexpected response keys {sorted(body.keys())}"
     assert body["side"] in {"front", "back"}, f"{case.name}: bad side {body['side']!r}"
     assert body["rotation_degrees"] in {
@@ -72,6 +74,19 @@ def test_fixture_end_to_end(case: FixtureCase):
     }, f"{case.name}: bad rotation {body['rotation_degrees']!r}"
     assert 0.0 <= body["orient_confidence"] <= 1.0
     assert body["text_count"] >= 0
+    # The committed fixtures are phone-camera photos (16:9 aspect) of cards,
+    # not already-tight card crops, so the cascade usually falls through to
+    # passthrough in slice 2a (no SAM yet). Just verify the source is a
+    # known label and the b64 field is consistent with it.
+    assert body["cropped_source"] in {
+        "precropped",
+        "pil_trim",
+        "passthrough",
+    }, f"{case.name}: unexpected cropped_source {body['cropped_source']!r}"
+    if body["cropped_source"] == "precropped":
+        assert (
+            body["cropped_image_b64"] is None
+        ), f"{case.name}: cropped_image_b64 should be null when source==precropped"
 
     # Sidecar-specific assertions.
     if case.rotation_degrees is not None:

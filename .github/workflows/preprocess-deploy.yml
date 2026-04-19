@@ -333,7 +333,7 @@ jobs:
           echo "Previous dev revision: $PREV"
           echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
 
-      - name: Deploy to dev Cloud Run (immediate traffic)
+      - name: Deploy to dev Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: neonbinder-preprocess
@@ -341,6 +341,20 @@ jobs:
           image: gcr.io/neonbinder-dev/neonbinder-preprocess:${{ github.sha }}
           project_id: neonbinder-dev
           env_vars: ENVIRONMENT=dev
+
+      # deploy-cloudrun@v2 only auto-routes traffic to the new revision when
+      # the service's traffic config is already at `latest_revision = true`.
+      # Our service history (bootstrap cloudrun/hello revision + intermittent
+      # PR-preview tags) flips traffic into explicit-revision mode, so the
+      # implicit latest-revision routing never fires. Force the shift
+      # explicitly so dev always serves main's HEAD after a merge.
+      - name: Shift dev traffic to latest revision
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic neonbinder-preprocess \
+            --region=us-central1 \
+            --project=neonbinder-dev \
+            --to-latest
 
   dev-smoke:
     needs: deploy-dev

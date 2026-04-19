@@ -1,0 +1,42 @@
+name: Preview Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+# When a PR closes (merged or not), remove the `pr-<N>` tag from the dev Cloud
+# Run service so the preview URL stops resolving and the tag slot is freed up
+# for future use. Cloud Run GCs the underlying revision on its own once it's
+# neither serving traffic nor holding a tag.
+jobs:
+  cleanup:
+    if: |
+      github.base_ref == 'main'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_PREPROCESS_DEV }}
+          service_account: ${{ secrets.GCP_SA_PREPROCESS_DEPLOYER_DEV }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Remove pr-<N> tag from dev Cloud Run service
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          TAG="pr-$PR"
+          echo "Removing tag $TAG from neonbinder-preprocess (neonbinder-dev)"
+          # `--remove-tags` is idempotent — if the tag is absent (e.g. the
+          # deploy-preview job never succeeded for this PR) gcloud still
+          # exits 0. That's desired: cleanup should never fail a PR close.
+          gcloud run services update-traffic neonbinder-preprocess \
+            --region=us-central1 \
+            --project=neonbinder-dev \
+            --remove-tags="$TAG"

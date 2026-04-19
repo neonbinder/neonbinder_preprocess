@@ -123,6 +123,8 @@ class TestProcessHappyPath:
             "rotation_degrees",
             "orient_confidence",
             "text_count",
+            "cropped_source",
+            "cropped_image_b64",
         }
         assert set(body.keys()) == expected_keys, f"unexpected keys {sorted(body.keys())}"
         assert body["side"] in {"front", "back"}, f"bad side {body['side']!r}"
@@ -134,3 +136,12 @@ class TestProcessHappyPath:
         }, f"bad rotation {body['rotation_degrees']!r}"
         assert 0.0 <= body["orient_confidence"] <= 1.0
         assert isinstance(body["text_count"], int) and body["text_count"] >= 0
+        # Synthetic test image is card-shaped (600x900) and noisy → passes the
+        # precropped validator. cropped_image_b64 should be null in that case.
+        assert body["cropped_source"] in {
+            "precropped",
+            "pil_trim",
+            "passthrough",
+        }, f"unexpected cropped_source {body['cropped_source']!r}"
+        if body["cropped_source"] == "precropped":
+            assert body["cropped_image_b64"] is None

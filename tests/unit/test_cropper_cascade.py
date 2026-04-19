@@ -70,10 +70,53 @@ class TestCascade:
         assert result.image_bytes == synthetic_trimmed
         assert result.returned_bytes_differ is True
 
-    def test_pil_trim_output_rejected_falls_through_to_passthrough(self, monkeypatch):
-        # pil_trim returns something, but it fails validation (too small).
-        # Cascade should fall through to passthrough.
+    def test_pil_trim_output_rejected_sam_wins(self, monkeypatch):
+        # pil_trim returns something that fails validation, then SAM produces
+        # a good crop. Cascade should pick SAM.
+        synthetic_sam = _card_jpeg(size=(500, 700))
         monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: _tiny_jpeg())
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: synthetic_sam)
+
+        image_bytes = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image_bytes, precropped_bytes=bad_precropped)
+
+        assert result.source == "sam"
+        assert result.image_bytes == synthetic_sam
+        assert result.returned_bytes_differ is True
+
+    def test_pil_trim_returns_none_sam_wins(self, monkeypatch):
+        synthetic_sam = _card_jpeg(size=(500, 700))
+        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: synthetic_sam)
+
+        image_bytes = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image_bytes, precropped_bytes=bad_precropped)
+
+        assert result.source == "sam"
+
+    def test_pil_trim_raises_sam_wins(self, monkeypatch):
+        def _boom(_b):
+            raise RuntimeError("pil_trim exploded")
+
+        synthetic_sam = _card_jpeg(size=(500, 700))
+        monkeypatch.setattr("app.cropper.pil_trim.trim", _boom)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: synthetic_sam)
+
+        image_bytes = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image_bytes, precropped_bytes=bad_precropped)
+
+        # Exception in pil_trim must not kill the cascade — SAM still runs.
+        assert result.source == "sam"
+
+    def test_all_strategies_fail_falls_through_to_passthrough(self, monkeypatch):
+        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
 
         image_bytes = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
@@ -84,8 +127,10 @@ class TestCascade:
         assert result.image_bytes == image_bytes
         assert result.returned_bytes_differ is False
 
-    def test_pil_trim_returns_none_falls_through_to_passthrough(self, monkeypatch):
+    def test_sam_output_rejected_falls_through_to_passthrough(self, monkeypatch):
+        # SAM returns something, but validator rejects it (too small).
         monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: _tiny_jpeg())
 
         image_bytes = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
@@ -93,22 +138,20 @@ class TestCascade:
         result = crop(image_bytes=image_bytes, precropped_bytes=bad_precropped)
 
         assert result.source == "passthrough"
-        assert result.image_bytes == image_bytes
 
-    def test_pil_trim_raises_falls_through_to_passthrough(self, monkeypatch):
+    def test_sam_raises_falls_through_to_passthrough(self, monkeypatch):
         def _boom(_b):
-            raise RuntimeError("pil_trim exploded")
+            raise RuntimeError("SAM exploded")
 
-        monkeypatch.setattr("app.cropper.pil_trim.trim", _boom)
+        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", _boom)
 
         image_bytes = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
 
         result = crop(image_bytes=image_bytes, precropped_bytes=bad_precropped)
 
-        # Exception in a strategy must not kill the cascade — fall through.
         assert result.source == "passthrough"
-        assert result.image_bytes == image_bytes
 
     def test_crop_result_is_immutable_dataclass(self):
         r = CropResult(image_bytes=b"x", source="precropped", returned_bytes_differ=False)

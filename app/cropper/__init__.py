@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from app.cropper import pil_trim
+from app.cropper import pil_trim, sam
 from app.cropper.validator import is_plausible_crop
 
 logger = logging.getLogger(__name__)
@@ -90,7 +90,24 @@ def crop(
             )
         logger.info("cascade: pil_trim rejected (%s)", check.reason)
 
-    # TODO(slice-2b): insert `sam` strategy here.
+    # Stage 3 — SAM semantic segmentation. Heavy; only fires when the cheap
+    # strategies above failed. First invocation per container cold-loads the
+    # 375MB model (~5-15s); subsequent calls are ~2-3s inference.
+    try:
+        sam_result = sam.sam_crop(image_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cascade: sam raised %s", exc)
+        sam_result = None
+    if sam_result is not None:
+        check = is_plausible_crop(sam_result, source_area_bytes=image_bytes)
+        if check.ok:
+            return CropResult(
+                image_bytes=sam_result,
+                source="sam",
+                returned_bytes_differ=True,
+            )
+        logger.info("cascade: sam rejected (%s)", check.reason)
+
     # TODO(slice-2c): insert `haiku_bbox` strategy here.
 
     # Stage N — passthrough. Return original unchanged so orient+classify have

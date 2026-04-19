@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="neonbinder-preprocess", version="0.1.0")
 
 INTERNAL_API_KEY_ENV = "INTERNAL_API_KEY"
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_BYTES = 32 * 1024 * 1024
 ALLOWED_CONTENT_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 
 

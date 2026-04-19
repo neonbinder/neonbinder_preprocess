@@ -15,10 +15,12 @@ import pytest
 from PIL import Image
 
 from app.classify import (
+    ANTHROPIC_MAX_RAW_BYTES,
     PROMPT,
     RETRY_PROMPT_SUFFIX,
     ClassifyError,
     _detect_media_type,
+    _prepare_for_anthropic,
     _strip_code_fences,
     classify_card,
 )
@@ -70,6 +72,40 @@ class TestHelpers:
 
     def test_detect_media_type_garbage_falls_back_to_jpeg(self):
         assert _detect_media_type(b"not an image") == "image/jpeg"
+
+
+class TestPrepareForAnthropic:
+    def test_small_image_passes_through_unchanged(self):
+        original = _jpeg_bytes()
+        assert len(original) <= ANTHROPIC_MAX_RAW_BYTES
+
+        payload, media_type = _prepare_for_anthropic(original)
+
+        assert payload == original
+        assert media_type == "image/jpeg"
+
+    def test_large_image_is_downscaled_to_fit(self):
+        # A realistic phone-shot-sized PNG: 4000×3000 ≈ 48MP of noise that
+        # compresses poorly. Ensures the downscale path actually kicks in.
+        import os
+
+        big = io.BytesIO()
+        Image.frombytes(
+            "RGB",
+            (4000, 3000),
+            os.urandom(4000 * 3000 * 3),
+        ).save(big, format="PNG")
+        oversized = big.getvalue()
+        assert len(oversized) > ANTHROPIC_MAX_RAW_BYTES
+
+        payload, media_type = _prepare_for_anthropic(oversized)
+
+        assert len(payload) <= ANTHROPIC_MAX_RAW_BYTES
+        # Always re-encoded as JPEG when downscaling.
+        assert media_type == "image/jpeg"
+        with Image.open(io.BytesIO(payload)) as result:
+            # Longest edge must be at or below the downscale cap.
+            assert max(result.size) <= 1600
 
 
 class TestClassifyCard:

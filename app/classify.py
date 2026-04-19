@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 MAX_TOKENS = 512
+# Structured extraction benefits from low temperature — cuts LLM drift on
+# ambiguous fields (e.g. whether the team appears on a given card back) and
+# keeps integration-test assertions stable across reruns.
+TEMPERATURE = 0.0
+
+# Anthropic rejects base64 image payloads over 5 MB. Base64 expands raw bytes
+# by ~33%, so we target a raw-byte ceiling of ~3.5 MB with comfortable margin.
+# Images above this are re-encoded as JPEG with longest edge capped at
+# `DOWNSCALE_MAX_EDGE_PX`, which preserves enough detail for card-text reads.
+ANTHROPIC_MAX_RAW_BYTES = 3_500_000
+DOWNSCALE_MAX_EDGE_PX = 1600
+DOWNSCALE_JPEG_QUALITY = 85
 
 PROMPT = """You are analyzing a trading card photo. Extract key fields as a strict JSON object
 with these keys:
@@ -67,6 +79,31 @@ def _detect_media_type(image_bytes: bytes) -> str:
         return "image/jpeg"
 
 
+def _prepare_for_anthropic(image_bytes: bytes) -> tuple[bytes, str]:
+    """Return (bytes, media_type) fitting Anthropic's 5 MB base64 ceiling.
+
+    Images already under the raw-byte budget pass through unchanged. Oversized
+    images are re-encoded as JPEG with the longest edge capped; if that still
+    overshoots, the edge cap is halved progressively until the result fits.
+    """
+    if len(image_bytes) <= ANTHROPIC_MAX_RAW_BYTES:
+        return image_bytes, _detect_media_type(image_bytes)
+
+    with Image.open(BytesIO(image_bytes)) as img:
+        rgb = img.convert("RGB")
+
+    max_edge = DOWNSCALE_MAX_EDGE_PX
+    while True:
+        working = rgb.copy()
+        working.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        out = BytesIO()
+        working.save(out, format="JPEG", quality=DOWNSCALE_JPEG_QUALITY)
+        payload = out.getvalue()
+        if len(payload) <= ANTHROPIC_MAX_RAW_BYTES or max_edge <= 256:
+            return payload, "image/jpeg"
+        max_edge //= 2
+
+
 def _strip_code_fences(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -112,6 +149,7 @@ def _call_model(
     response = client.messages.create(
         model=model,
         max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE,
         messages=[
             {
                 "role": "user",
@@ -151,8 +189,8 @@ def classify_card(
         raise ValueError("image_bytes is empty")
 
     ai_client = client or anthropic.Anthropic()
-    media_type = _detect_media_type(image_bytes)
-    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload, media_type = _prepare_for_anthropic(image_bytes)
+    image_b64 = base64.b64encode(payload).decode("ascii")
 
     first_text = _call_model(
         ai_client,

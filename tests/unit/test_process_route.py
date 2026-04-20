@@ -370,7 +370,7 @@ class TestPrecroppedField:
         # Force pil_trim to return known good card-shaped bytes. The cascade
         # will pick it and returned_bytes_differ will be True.
         good_crop = self._card_bytes()
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: good_crop)
+        monkeypatch.setattr("app.cropper.pil_trim.trim_dark", lambda _b: good_crop)
 
         response = client.post(
             "/process",
@@ -382,7 +382,7 @@ class TestPrecroppedField:
         )
         assert response.status_code == 200
         body = response.json()
-        assert body["cropped_source"] == "pil_trim"
+        assert body["cropped_source"] == "pil_trim_dark"
         assert body["cropped_image_b64"] is not None
         import base64
 

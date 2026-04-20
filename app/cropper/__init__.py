@@ -49,7 +49,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.classify import ClassifyResult, classify_card
-from app.cropper import pil_trim, sam
+from app.cropper import haiku_bbox, pil_trim, sam
 from app.cropper._utils import rotate_image_bytes
 from app.cropper.validator import is_plausible_crop
 from app.orient import OrientationResult, detect_orientation
@@ -76,7 +76,7 @@ CropStrategy = Callable[[bytes], bytes | None]
 _STRATEGIES: list[tuple[str, object, str]] = [
     ("pil_trim", pil_trim, "trim"),
     ("sam", sam, "sam_crop"),
-    # TODO(slice-2c): ("haiku_bbox", haiku_bbox, "crop"),
+    ("haiku_bbox", haiku_bbox, "haiku_bbox_crop"),
 ]
 
 

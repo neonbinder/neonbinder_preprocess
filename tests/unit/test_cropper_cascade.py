@@ -278,13 +278,75 @@ class TestSamStage:
         assert result.source == "sam"
         assert result.classification.players == []
 
-    def test_sam_raises_falls_through_to_passthrough(self, monkeypatch, stub_orient, stub_classify):
+    def test_sam_raises_falls_through_to_haiku_bbox(self, monkeypatch, stub_orient, stub_classify):
+        """pil_trim empty + SAM raises → cascade tries haiku_bbox next."""
+        good = _card_jpeg(size=(500, 700))
         monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
 
         def _boom(_b):
             raise RuntimeError("SAM crashed")
 
         monkeypatch.setattr("app.cropper.sam.sam_crop", _boom)
+        monkeypatch.setattr("app.cropper.haiku_bbox.haiku_bbox_crop", lambda _b: good)
+
+        stub_orient()
+        stub_classify(_classify())
+
+        image = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
+
+        assert result.source == "haiku_bbox"
+
+
+class TestHaikuBboxStage:
+    def test_haiku_bbox_wins_when_earlier_stages_fail(
+        self, monkeypatch, stub_orient, stub_classify
+    ):
+        good = _card_jpeg(size=(500, 700))
+        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
+        monkeypatch.setattr("app.cropper.haiku_bbox.haiku_bbox_crop", lambda _b: good)
+
+        stub_orient()
+        stub_classify(_classify())
+
+        image = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
+
+        assert result.source == "haiku_bbox"
+        assert result.returned_bytes_differ is True
+
+    def test_haiku_bbox_empty_falls_through_to_passthrough(
+        self, monkeypatch, stub_orient, stub_classify
+    ):
+        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
+        monkeypatch.setattr("app.cropper.haiku_bbox.haiku_bbox_crop", lambda _b: None)
+
+        stub_orient()
+        stub_classify(_classify())
+
+        image = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
+
+        assert result.source == "passthrough"
+
+    def test_haiku_bbox_raises_falls_through_to_passthrough(
+        self, monkeypatch, stub_orient, stub_classify
+    ):
+        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
+
+        def _boom(_b):
+            raise RuntimeError("anthropic down")
+
+        monkeypatch.setattr("app.cropper.haiku_bbox.haiku_bbox_crop", _boom)
 
         stub_orient()
         stub_classify(_classify())

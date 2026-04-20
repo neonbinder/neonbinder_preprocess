@@ -34,6 +34,11 @@ ALLOWED_CONTENT_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 class ProcessResponse(BaseModel):
     """Response body for POST /process.
 
+    `players` is the canonical list of every player visible on the card
+    (one entry for single-player cards, many for leaders/combo/dual-
+    rookie/team set cards, empty when unidentifiable). `player` is a
+    back-compat convenience: first entry or null.
+
     `rotation_degrees` is the CCW rotation that was applied to the chosen
     crop before classification; clients that store the corrected image
     should apply the same rotation to keep their copy aligned with what
@@ -46,6 +51,7 @@ class ProcessResponse(BaseModel):
     returns them base64-encoded in `cropped_image_b64`.
     """
 
+    players: list[str]
     player: str | None
     team: str | None
     card_number: str | None
@@ -137,6 +143,7 @@ async def process(
         cropped_image_b64 = base64.b64encode(result.image_bytes).decode("ascii")
 
     return ProcessResponse(
+        players=list(result.classification.players),
         player=result.classification.player,
         team=result.classification.team,
         card_number=result.classification.card_number,

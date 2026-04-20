@@ -57,7 +57,11 @@ def _classify(
     side: str = "front",
 ) -> ClassifyResult:
     return ClassifyResult(
-        player=player, team=team, card_number=card_number, side=side, raw_text="{}"
+        players=[player] if player else [],
+        team=team,
+        card_number=card_number,
+        side=side,
+        raw_text="{}",
     )
 
 
@@ -147,27 +151,33 @@ class TestPrecroppedShortCircuit:
         assert result.source == "precropped"
         assert result.image_bytes == image
 
-    def test_precropped_classify_error_falls_through_to_pil_trim(
+    def test_precropped_classify_error_is_kept_not_dropped(
         self, monkeypatch, stub_orient, stub_classify
     ):
-        # Precropped passes the validator but classify says null/null/back.
-        # Cascade should advance to pil_trim, which returns a good crop.
-        good_trim = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: good_trim)
-
-        stub_orient()  # all calls return text_count=10
-        stub_classify(_classify_error(), _classify())
-        # 1st classify: precropped → error → fall through
-        # 2nd classify: pil_trim → good → win
+        # The empty-players/null-card_number/back pattern is legitimate on
+        # multi-player leaders/combo card backs. When precropped passes the
+        # validator we trust classify's output — even if it's "hard to
+        # identify" — rather than falling through. The cascade's text-count
+        # gate is enough to catch wrong-region crops without this heuristic.
+        stub_orient()
+        stub_classify(_classify_error())
+        # Cascade should short-circuit on precropped with this classify
+        # output, NOT call pil_trim. Guard: if pil_trim is invoked, the
+        # test fails because stub_classify exhausted its queue but the
+        # assertion below doesn't care about fall-through behavior.
+        monkeypatch.setattr(
+            "app.cropper.pil_trim.trim",
+            lambda _b: pytest.fail("cascade should not have reached pil_trim"),
+        )
 
         image = _card_jpeg(size=(1200, 1600))
         precropped = _card_jpeg(size=(500, 700))
 
         result = crop(image_bytes=image, precropped_bytes=precropped)
 
-        assert result.source == "pil_trim"
-        assert result.image_bytes == good_trim
-        assert result.returned_bytes_differ is True
+        assert result.source == "precropped"
+        assert result.classification.players == []
+        assert result.classification.side == "back"
 
 
 class TestPilTrimStage:
@@ -213,23 +223,26 @@ class TestPilTrimStage:
 
         assert result.source == "sam"
 
-    def test_pil_trim_classify_error_falls_through(self, monkeypatch, stub_orient, stub_classify):
-        """pil_trim passes validator + text-count but classify is a wrong-region signal."""
+    def test_pil_trim_classify_error_is_kept(self, monkeypatch, stub_orient, stub_classify):
+        """Empty players + back is legitimate on multi-player backs — don't fall through."""
         good = _card_jpeg(size=(500, 700))
         monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: good)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: good)
+        # If cascade falls through to SAM, the test fails loudly.
+        monkeypatch.setattr(
+            "app.cropper.sam.sam_crop",
+            lambda _b: pytest.fail("cascade should not have reached SAM"),
+        )
 
-        stub_orient()  # all calls return text_count=10
-        stub_classify(_classify_error(), _classify())
-        # 1st classify: pil_trim → null/null/back → fall through
-        # 2nd classify: sam → good → win
+        stub_orient()
+        stub_classify(_classify_error())
 
         image = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
 
         result = crop(image_bytes=image, precropped_bytes=bad_precropped)
 
-        assert result.source == "sam"
+        assert result.source == "pil_trim"
+        assert result.classification.players == []
 
 
 class TestSamStage:
@@ -248,26 +261,22 @@ class TestSamStage:
 
         assert result.source == "sam"
 
-    def test_sam_classify_error_falls_through_to_passthrough(
-        self, monkeypatch, stub_orient, stub_classify
-    ):
+    def test_sam_classify_error_is_kept(self, monkeypatch, stub_orient, stub_classify):
+        """Same rule as pil_trim: empty players on SAM's output is legitimate."""
         good = _card_jpeg(size=(500, 700))
         monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
         monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: good)
 
         stub_orient()
-        # Two classify calls:
-        #   1. sam → classify_error → fall through
-        #   2. passthrough → good → packaged (baseline path)
-        stub_classify(_classify_error(), _classify())
+        stub_classify(_classify_error())
 
         image = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
 
         result = crop(image_bytes=image, precropped_bytes=bad_precropped)
 
-        assert result.source == "passthrough"
-        assert result.image_bytes == image
+        assert result.source == "sam"
+        assert result.classification.players == []
 
     def test_sam_raises_falls_through_to_passthrough(self, monkeypatch, stub_orient, stub_classify):
         monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)

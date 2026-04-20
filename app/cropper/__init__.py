@@ -21,14 +21,17 @@ Gates (applied to every strategy uniformly):
    `MIN_CASCADE_TEXT_RATIO` of that baseline, or the stage is rejected.
    Catches wrong-region crops that *happen* to be card-shaped.
 
-3. **Classify-error guard** — after orient+rotate+classify, if the result
-   is `player=None AND card_number=None AND side="back"`, the crop almost
-   certainly captured the wrong region. Reject and fall through.
+   (An earlier iteration also had a "classify-error guard" — reject when
+   players+card_number both null AND side=back — but it misfired on
+   legitimate multi-player leaders/combo card backs where those fields
+   are genuinely null. The text-count gate alone is enough to catch
+   wrong-region crops without false-rejecting real backs.)
 
 If every strategy fails, the passthrough fallback carries whatever
-orient+classify produced on the raw image — which may itself hit the
-null/null/back pattern. That's acceptable: the client can surface it as
-"preprocess couldn't identify this card" and route upstream.
+orient+classify produced on the raw image — which may itself return
+empty players / null card_number. That's acceptable: the client can
+surface it as "preprocess couldn't identify this card" and route to a
+manual path upstream.
 
 Source labels (order of preference):
     precropped : client-supplied crop; trusted when validator + classify-
@@ -94,26 +97,6 @@ class CropResult:
     classification: ClassifyResult
 
 
-def _is_classify_error(classification: ClassifyResult) -> bool:
-    """Heuristic signal that a crop captured the wrong region.
-
-    A real card (front or back) exposes at least *some* structured content —
-    player name, copyright text, card number, team logo, etc. Getting null
-    on both player AND card_number while the model also flips side to
-    "back" is the signature of a crop that doesn't show a card at all (or
-    shows a blurry back-of-card remnant with no readable fields).
-
-    This is the specific combination observed on SAM's wrong-region crops
-    in production; it's conservative enough not to reject legitimate
-    back-side crops that have a visible card number.
-    """
-    return (
-        classification.player is None
-        and classification.card_number is None
-        and classification.side == "back"
-    )
-
-
 def _orient_and_classify(image_bytes: bytes) -> tuple[OrientationResult, ClassifyResult]:
     orient = detect_orientation(image_bytes)
     rotated = rotate_image_bytes(image_bytes, orient.rotation_degrees)
@@ -150,9 +133,6 @@ def _try_stage(
 
     rotated = rotate_image_bytes(candidate_bytes, orient.rotation_degrees)
     classification = classify_card(rotated)
-    if _is_classify_error(classification):
-        logger.info("cascade: %s produced classify error (null/null/back), falling through", source)
-        return None
 
     return CropResult(
         image_bytes=candidate_bytes,
@@ -183,17 +163,14 @@ def crop(
     check = is_plausible_crop(candidate)
     if check.ok:
         orient, classification = _orient_and_classify(candidate)
-        if not _is_classify_error(classification):
-            return CropResult(
-                image_bytes=candidate,
-                source="precropped",
-                returned_bytes_differ=False,
-                orientation=orient,
-                classification=classification,
-            )
-        logger.info("cascade: precropped produced classify error, falling through")
-    else:
-        logger.info("cascade: precropped rejected by validator (%s)", check.reason)
+        return CropResult(
+            image_bytes=candidate,
+            source="precropped",
+            returned_bytes_differ=False,
+            orientation=orient,
+            classification=classification,
+        )
+    logger.info("cascade: precropped rejected by validator (%s)", check.reason)
 
     # Baseline — used for both the text-count threshold and the passthrough
     # fallback so we never orient the same bytes twice.

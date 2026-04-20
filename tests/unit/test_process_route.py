@@ -58,7 +58,7 @@ def _stub_classify(
     side="front",
 ):
     result = ClassifyResult(
-        player=player,
+        players=[player] if player else [],
         team=team,
         card_number=card_number,
         side=side,
@@ -200,6 +200,7 @@ class TestHappyPath:
         assert response.status_code == 200
         body = response.json()
         assert body == {
+            "players": ["Jeter"],
             "player": "Jeter",
             "team": "Yankees",
             "card_number": "2",

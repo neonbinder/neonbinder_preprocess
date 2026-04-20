@@ -1,20 +1,11 @@
 """FastAPI entrypoint for the neonbinder-preprocess service.
 
-Slice 1 (shipped): `/health` + `/process`. `/process` accepts a card image
-and returns the structured orient + classify result plus the CCW rotation
-applied before classification.
-
-Slice 2a (this change): `/process` now optionally accepts a `precropped`
-multipart field. When present, the server validates it; if it looks like
-a plausible card, the server uses it as-is. Otherwise (or when omitted),
-the server runs a crop cascade (currently: PIL trim → passthrough) on
-the raw `image` field. The response advertises which source won via
-`cropped_source` and, when the server produced new bytes, includes them
-as base64 in `cropped_image_b64` so the client can persist the oriented
-copy without re-running anything.
-
-Future slices will add `sam` (2b) and `haiku_bbox` (2c) between pil_trim
-and passthrough in the cascade.
+Slice 1: `/health` + `/process` with orient→rotate→classify pipeline.
+Slice 2a: optional `precropped` multipart field, crop cascade.
+Slice 2b: SAM added to the cascade; text-count + classify-error gates
+          applied uniformly across every crop strategy via the wrapper
+          in `app.cropper`. Main.py is now a thin layer: auth + upload
+          validation → cropper.crop() → response packaging.
 """
 
 from __future__ import annotations
@@ -23,20 +14,17 @@ import base64
 import hmac
 import logging
 import os
-from io import BytesIO
 from typing import Annotated
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
-from PIL import Image
 from pydantic import BaseModel
 
 from app import cropper
-from app.classify import ClassifyError, classify_card
-from app.orient import detect_orientation
+from app.classify import ClassifyError
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="neonbinder-preprocess", version="0.2.0")
+app = FastAPI(title="neonbinder-preprocess", version="0.3.0")
 
 INTERNAL_API_KEY_ENV = "INTERNAL_API_KEY"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -52,11 +40,10 @@ class ProcessResponse(BaseModel):
     the model actually saw.
 
     `cropped_source` tells the client which stage of the crop cascade
-    produced the working image. When it is `"precropped"` the client's
-    upload was used as-is and `cropped_image_b64` will be null (the client
-    already has the bytes on disk). For every other source, the server
-    produced new bytes and returns them base64-encoded in
-    `cropped_image_b64` so the client can persist them.
+    won. When it is `"precropped"` the client's upload was used as-is and
+    `cropped_image_b64` will be null (the client already has the bytes
+    on disk). For every other source, the server produced new bytes and
+    returns them base64-encoded in `cropped_image_b64`.
     """
 
     player: str | None
@@ -92,12 +79,7 @@ def _validate_content_type(content_type: str | None, *, field: str) -> None:
         )
 
 
-async def _read_upload(
-    upload: UploadFile,
-    *,
-    field: str,
-) -> bytes:
-    """Read an UploadFile, enforcing content-type and size gates."""
+async def _read_upload(upload: UploadFile, *, field: str) -> bytes:
     _validate_content_type(upload.content_type, field=field)
     data = await upload.read()
     if not data:
@@ -111,17 +93,6 @@ async def _read_upload(
             detail=f"{field} exceeds max size of {MAX_IMAGE_BYTES} bytes",
         )
     return data
-
-
-def _rotate_image_bytes(image_bytes: bytes, degrees_ccw: int) -> bytes:
-    if degrees_ccw % 360 == 0:
-        return image_bytes
-    with Image.open(BytesIO(image_bytes)) as img:
-        fmt = img.format or "JPEG"
-        rotated = img.rotate(degrees_ccw, expand=True)
-        out = BytesIO()
-        rotated.save(out, format=fmt)
-        return out.getvalue()
 
 
 @app.get("/health")
@@ -142,24 +113,12 @@ async def process(
     if precropped is not None:
         precropped_bytes = await _read_upload(precropped, field="precropped")
 
-    crop_result = cropper.crop(
-        image_bytes=image_bytes,
-        precropped_bytes=precropped_bytes,
-    )
-
+    # The cascade handles orient + rotate + classify internally so every
+    # crop strategy is evaluated through the same quality gates. Upstream
+    # failures (Vision / Anthropic) surface as exceptions we translate to
+    # 502 here.
     try:
-        orientation = detect_orientation(crop_result.image_bytes)
-    except Exception:
-        logger.exception("orient failed")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="orientation upstream failure",
-        ) from None
-
-    rotated_bytes = _rotate_image_bytes(crop_result.image_bytes, orientation.rotation_degrees)
-
-    try:
-        classification = classify_card(rotated_bytes)
+        result = cropper.crop(image_bytes=image_bytes, precropped_bytes=precropped_bytes)
     except ClassifyError:
         logger.exception("classify failed to parse after retry")
         raise HTTPException(
@@ -167,24 +126,24 @@ async def process(
             detail="classify response unparseable",
         ) from None
     except Exception:
-        logger.exception("classify failed")
+        logger.exception("cascade failed")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="classify upstream failure",
+            detail="preprocess pipeline upstream failure",
         ) from None
 
     cropped_image_b64: str | None = None
-    if crop_result.returned_bytes_differ:
-        cropped_image_b64 = base64.b64encode(crop_result.image_bytes).decode("ascii")
+    if result.returned_bytes_differ:
+        cropped_image_b64 = base64.b64encode(result.image_bytes).decode("ascii")
 
     return ProcessResponse(
-        player=classification.player,
-        team=classification.team,
-        card_number=classification.card_number,
-        side=classification.side,
-        rotation_degrees=orientation.rotation_degrees,
-        orient_confidence=orientation.confidence,
-        text_count=orientation.text_count,
-        cropped_source=crop_result.source,
+        player=result.classification.player,
+        team=result.classification.team,
+        card_number=result.classification.card_number,
+        side=result.classification.side,
+        rotation_degrees=result.orientation.rotation_degrees,
+        orient_confidence=result.orientation.confidence,
+        text_count=result.orientation.text_count,
+        cropped_source=result.source,
         cropped_image_b64=cropped_image_b64,
     )

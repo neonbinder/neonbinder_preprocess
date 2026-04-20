@@ -1,13 +1,13 @@
 """Unit tests for app.cropper.crop — the cascade orchestrator.
 
-Stubs the four building blocks the cascade talks to:
-    pil_trim.trim, sam.sam_crop      — crop strategies
-    detect_orientation, classify_card — quality gate inputs
+Slice 3 folded precropped into the same uniform-gate loop as every other
+strategy. Every stage now:
+  1. Validator (is_plausible_crop)
+  2. Text-count regression guard (against baseline orient on raw image)
+  3. Classify call (no classify-level gate — result is packaged as-is)
 
-Each test exercises one branch of the three-gate wrapper:
-    1. geometric validator
-    2. text-count regression guard (vs. passthrough baseline)
-    3. classify-error guard (player+card_number null + side=back)
+Tests stub `detect_orientation` and `classify_card` on the `cropper`
+module binding because that's where `crop()` imports them.
 """
 
 from __future__ import annotations
@@ -65,14 +65,9 @@ def _classify(
     )
 
 
-def _classify_error() -> ClassifyResult:
-    """The null/null/back pattern the cascade treats as a crop error."""
-    return _classify(player=None, card_number=None, side="back")
-
-
 @pytest.fixture
 def stub_orient(monkeypatch):
-    """Factory: install an orient stub that returns the same result for every call."""
+    """Install an orient stub that returns the same result for every call."""
 
     def _install(result: OrientationResult | None = None) -> list[bytes]:
         result = result or _orient()
@@ -124,10 +119,37 @@ def stub_classify(monkeypatch):
     return _install
 
 
-class TestPrecroppedShortCircuit:
-    def test_valid_precropped_with_good_classify_is_used(self, stub_orient, stub_classify):
+@pytest.fixture
+def disable_server_strategies(monkeypatch):
+    """Factory to stub out the server-side croppers so only precropped runs.
+
+    Returns a helper that accepts kwargs for each strategy (default None).
+    Any not explicitly overridden returns None (skipped by cascade).
+    """
+
+    def _install(**overrides) -> None:
+        defaults = {
+            "trim_dark": None,
+            "trim_light": None,
+            "sam_crop": None,
+            "haiku_bbox_crop": None,
+        }
+        defaults.update(overrides)
+        monkeypatch.setattr("app.cropper.pil_trim.trim_dark", lambda _b: defaults["trim_dark"])
+        monkeypatch.setattr("app.cropper.pil_trim.trim_light", lambda _b: defaults["trim_light"])
+        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: defaults["sam_crop"])
+        monkeypatch.setattr(
+            "app.cropper.haiku_bbox.haiku_bbox_crop", lambda _b: defaults["haiku_bbox_crop"]
+        )
+
+    return _install
+
+
+class TestPrecroppedStage:
+    def test_valid_precropped_wins(self, stub_orient, stub_classify, disable_server_strategies):
         stub_orient()
         stub_classify(_classify())
+        disable_server_strategies()
 
         image = _card_jpeg(size=(1200, 1600))
         precropped = _card_jpeg(size=(500, 700))
@@ -137,12 +159,14 @@ class TestPrecroppedShortCircuit:
         assert result.source == "precropped"
         assert result.image_bytes == precropped
         assert result.returned_bytes_differ is False
-        assert result.classification.player == "Ichiro"
+        assert result.classification.players == ["Ichiro"]
 
-    def test_missing_precropped_uses_image_when_image_validates(self, stub_orient, stub_classify):
-        # Slice-1 compat: no precropped, image looks card-shaped → short-circuit.
+    def test_missing_precropped_uses_image_candidate(
+        self, stub_orient, stub_classify, disable_server_strategies
+    ):
         stub_orient()
         stub_classify(_classify())
+        disable_server_strategies()
 
         image = _card_jpeg(size=(500, 700))
 
@@ -150,46 +174,97 @@ class TestPrecroppedShortCircuit:
 
         assert result.source == "precropped"
         assert result.image_bytes == image
+        assert result.returned_bytes_differ is False
 
-    def test_precropped_classify_error_is_kept_not_dropped(
-        self, monkeypatch, stub_orient, stub_classify
+    def test_precropped_fails_validator_falls_through(
+        self, stub_orient, stub_classify, disable_server_strategies
     ):
-        # The empty-players/null-card_number/back pattern is legitimate on
-        # multi-player leaders/combo card backs. When precropped passes the
-        # validator we trust classify's output — even if it's "hard to
-        # identify" — rather than falling through. The cascade's text-count
-        # gate is enough to catch wrong-region crops without this heuristic.
+        # Tiny precropped fails the min-side check → falls through to server stages.
+        good_trim = _card_jpeg(size=(500, 700))
         stub_orient()
-        stub_classify(_classify_error())
-        # Cascade should short-circuit on precropped with this classify
-        # output, NOT call pil_trim. Guard: if pil_trim is invoked, the
-        # test fails because stub_classify exhausted its queue but the
-        # assertion below doesn't care about fall-through behavior.
-        monkeypatch.setattr(
-            "app.cropper.pil_trim.trim",
-            lambda _b: pytest.fail("cascade should not have reached pil_trim"),
-        )
+        stub_classify(_classify())
+        disable_server_strategies(trim_dark=good_trim)
 
         image = _card_jpeg(size=(1200, 1600))
-        precropped = _card_jpeg(size=(500, 700))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
+
+        assert result.source == "pil_trim_dark"
+        assert result.image_bytes == good_trim
+        assert result.returned_bytes_differ is True
+
+    def test_precropped_fails_text_count_gate_falls_through(
+        self, stub_orient_by_call, stub_classify, disable_server_strategies
+    ):
+        """Precropped passes validator but has text_count below threshold."""
+        good_trim = _card_jpeg(size=(500, 700))
+        disable_server_strategies(trim_dark=good_trim)
+
+        # Baseline text=10 → threshold=8. Precropped returns text=5 (fails gate).
+        # pil_trim_dark then returns text=10 (wins).
+        stub_orient_by_call(
+            _orient(text_count=10),  # baseline (raw image)
+            _orient(text_count=5),  # precropped — fails gate
+            _orient(text_count=10),  # pil_trim_dark output
+        )
+        stub_classify(_classify())  # pil_trim_dark's classify
+
+        image = _card_jpeg(size=(1200, 1600))
+        precropped = _card_jpeg(size=(500, 700))  # passes validator but low text
 
         result = crop(image_bytes=image, precropped_bytes=precropped)
 
-        assert result.source == "precropped"
-        assert result.classification.players == []
-        assert result.classification.side == "back"
+        assert result.source == "pil_trim_dark"
 
 
-class TestPilTrimStage:
-    def test_valid_pil_trim_with_sufficient_text_wins(
-        self, monkeypatch, stub_orient, stub_classify
+class TestPilTrimStages:
+    def test_pil_trim_dark_wins_when_it_produces_good_output(
+        self, stub_orient, stub_classify, disable_server_strategies
     ):
         good = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: good)
-
-        # Every orient call returns text_count=10. Threshold = 0.8 * 10 = 8,
-        # so pil_trim's 10 clears the gate.
         stub_orient()
+        stub_classify(_classify())
+        disable_server_strategies(trim_dark=good)
+
+        image = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
+
+        assert result.source == "pil_trim_dark"
+        assert result.returned_bytes_differ is True
+
+    def test_pil_trim_light_wins_when_dark_returns_none(
+        self, stub_orient, stub_classify, disable_server_strategies
+    ):
+        good = _card_jpeg(size=(500, 700))
+        stub_orient()
+        stub_classify(_classify())
+        disable_server_strategies(trim_dark=None, trim_light=good)
+
+        image = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
+
+        assert result.source == "pil_trim_light"
+        assert result.returned_bytes_differ is True
+
+    def test_pil_trim_text_count_drop_falls_through_to_sam(
+        self, stub_orient_by_call, stub_classify, disable_server_strategies
+    ):
+        """pil_trim_dark passes validator but drops too much text → SAM runs."""
+        good = _card_jpeg(size=(500, 700))
+        disable_server_strategies(trim_dark=good, sam_crop=good)
+
+        # baseline=10 → threshold=8. precropped (100x140) fails validator so
+        # no orient. pil_trim_dark output text=5 (fails gate). SAM output text=10 (wins).
+        stub_orient_by_call(
+            _orient(text_count=10),  # baseline
+            _orient(text_count=5),  # pil_trim_dark output
+            _orient(text_count=10),  # sam output
+        )
         stub_classify(_classify())
 
         image = _card_jpeg(size=(1200, 1600))
@@ -197,62 +272,17 @@ class TestPilTrimStage:
 
         result = crop(image_bytes=image, precropped_bytes=bad_precropped)
 
-        assert result.source == "pil_trim"
-
-    def test_pil_trim_text_count_drop_falls_through(
-        self, monkeypatch, stub_orient_by_call, stub_classify
-    ):
-        """pil_trim passes validator but drops too much text → fall through."""
-        good_sam = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: good_sam)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: good_sam)
-
-        # Baseline text=10 → threshold=8. pil_trim's text=5 fails the gate.
-        # Then cascade tries SAM (stubbed with text=10) → wins.
-        stub_orient_by_call(
-            _orient(text_count=10),  # baseline (passthrough)
-            _orient(text_count=5),  # pil_trim output
-            _orient(text_count=10),  # sam output
-        )
-        stub_classify(_classify())  # sam's classify (pil_trim never reached classify)
-
-        image = _card_jpeg(size=(1200, 1600))
-        bad_precropped = _tiny_jpeg()
-
-        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
-
         assert result.source == "sam"
-
-    def test_pil_trim_classify_error_is_kept(self, monkeypatch, stub_orient, stub_classify):
-        """Empty players + back is legitimate on multi-player backs — don't fall through."""
-        good = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: good)
-        # If cascade falls through to SAM, the test fails loudly.
-        monkeypatch.setattr(
-            "app.cropper.sam.sam_crop",
-            lambda _b: pytest.fail("cascade should not have reached SAM"),
-        )
-
-        stub_orient()
-        stub_classify(_classify_error())
-
-        image = _card_jpeg(size=(1200, 1600))
-        bad_precropped = _tiny_jpeg()
-
-        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
-
-        assert result.source == "pil_trim"
-        assert result.classification.players == []
 
 
 class TestSamStage:
-    def test_valid_sam_wins_when_pil_trim_empty(self, monkeypatch, stub_orient, stub_classify):
+    def test_valid_sam_wins_when_trim_variants_empty(
+        self, stub_orient, stub_classify, disable_server_strategies
+    ):
         good = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: good)
-
         stub_orient()
         stub_classify(_classify())
+        disable_server_strategies(sam_crop=good)
 
         image = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
@@ -261,27 +291,10 @@ class TestSamStage:
 
         assert result.source == "sam"
 
-    def test_sam_classify_error_is_kept(self, monkeypatch, stub_orient, stub_classify):
-        """Same rule as pil_trim: empty players on SAM's output is legitimate."""
+    def test_sam_raises_falls_through_to_haiku_bbox(self, stub_orient, stub_classify, monkeypatch):
         good = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: good)
-
-        stub_orient()
-        stub_classify(_classify_error())
-
-        image = _card_jpeg(size=(1200, 1600))
-        bad_precropped = _tiny_jpeg()
-
-        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
-
-        assert result.source == "sam"
-        assert result.classification.players == []
-
-    def test_sam_raises_falls_through_to_haiku_bbox(self, monkeypatch, stub_orient, stub_classify):
-        """pil_trim empty + SAM raises → cascade tries haiku_bbox next."""
-        good = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.pil_trim.trim_dark", lambda _b: None)
+        monkeypatch.setattr("app.cropper.pil_trim.trim_light", lambda _b: None)
 
         def _boom(_b):
             raise RuntimeError("SAM crashed")
@@ -301,16 +314,13 @@ class TestSamStage:
 
 
 class TestHaikuBboxStage:
-    def test_haiku_bbox_wins_when_earlier_stages_fail(
-        self, monkeypatch, stub_orient, stub_classify
+    def test_haiku_bbox_wins_when_earlier_fail(
+        self, stub_orient, stub_classify, disable_server_strategies
     ):
         good = _card_jpeg(size=(500, 700))
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
-        monkeypatch.setattr("app.cropper.haiku_bbox.haiku_bbox_crop", lambda _b: good)
-
         stub_orient()
         stub_classify(_classify())
+        disable_server_strategies(haiku_bbox_crop=good)
 
         image = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
@@ -320,27 +330,11 @@ class TestHaikuBboxStage:
         assert result.source == "haiku_bbox"
         assert result.returned_bytes_differ is True
 
-    def test_haiku_bbox_empty_falls_through_to_passthrough(
-        self, monkeypatch, stub_orient, stub_classify
-    ):
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
-        monkeypatch.setattr("app.cropper.haiku_bbox.haiku_bbox_crop", lambda _b: None)
-
-        stub_orient()
-        stub_classify(_classify())
-
-        image = _card_jpeg(size=(1200, 1600))
-        bad_precropped = _tiny_jpeg()
-
-        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
-
-        assert result.source == "passthrough"
-
     def test_haiku_bbox_raises_falls_through_to_passthrough(
-        self, monkeypatch, stub_orient, stub_classify
+        self, stub_orient, stub_classify, monkeypatch
     ):
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
+        monkeypatch.setattr("app.cropper.pil_trim.trim_dark", lambda _b: None)
+        monkeypatch.setattr("app.cropper.pil_trim.trim_light", lambda _b: None)
         monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
 
         def _boom(_b):
@@ -360,16 +354,12 @@ class TestHaikuBboxStage:
 
 
 class TestPassthroughFallback:
-    def test_all_stages_fail_returns_passthrough_with_its_own_classify(
-        self, monkeypatch, stub_orient, stub_classify
+    def test_all_stages_fail_returns_passthrough(
+        self, stub_orient, stub_classify, disable_server_strategies
     ):
-        """Every stage rejects → passthrough's classify rides through (even if an error)."""
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: None)
-
         stub_orient()
-        stub_classify(_classify_error())
-        # Only one classify call: on the passthrough's rotated bytes.
+        stub_classify(_classify())
+        disable_server_strategies()  # all None
 
         image = _card_jpeg(size=(1200, 1600))
         bad_precropped = _tiny_jpeg()
@@ -377,43 +367,45 @@ class TestPassthroughFallback:
         result = crop(image_bytes=image, precropped_bytes=bad_precropped)
 
         assert result.source == "passthrough"
-        assert result.classification.player is None
+        assert result.image_bytes == image
+        assert result.returned_bytes_differ is False
+
+    def test_passthrough_carries_empty_players_when_unidentifiable(
+        self, stub_orient, stub_classify, disable_server_strategies
+    ):
+        """All stages fail + classify returns empty fields → passthrough is honest."""
+        stub_orient()
+        stub_classify(_classify(player=None, team=None, card_number=None, side="back"))
+        disable_server_strategies()
+
+        image = _card_jpeg(size=(1200, 1600))
+        bad_precropped = _tiny_jpeg()
+
+        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
+
+        assert result.source == "passthrough"
+        assert result.classification.players == []
         assert result.classification.card_number is None
         assert result.classification.side == "back"
 
-    def test_sam_output_rejected_by_validator_passthrough_wins(
-        self, monkeypatch, stub_orient, stub_classify
-    ):
-        """SAM returns bytes that fail the validator (too small) → fall through."""
-        monkeypatch.setattr("app.cropper.pil_trim.trim", lambda _b: None)
-        monkeypatch.setattr("app.cropper.sam.sam_crop", lambda _b: _tiny_jpeg())
-
-        stub_orient()
-        stub_classify(_classify())
-
-        image = _card_jpeg(size=(1200, 1600))
-        bad_precropped = _tiny_jpeg()
-
-        result = crop(image_bytes=image, precropped_bytes=bad_precropped)
-
-        assert result.source == "passthrough"
-
 
 class TestCropResultShape:
-    def test_is_immutable_dataclass(self, stub_orient, stub_classify):
+    def test_is_immutable_dataclass(self, stub_orient, stub_classify, disable_server_strategies):
         stub_orient()
         stub_classify(_classify())
+        disable_server_strategies()
         result = crop(image_bytes=_card_jpeg(), precropped_bytes=None)
-        # Frozen dataclass raises FrozenInstanceError (subclass of AttributeError)
-        # on any field mutation.
         with pytest.raises(AttributeError):
             result.source = "other"  # type: ignore[misc]
 
-    def test_carries_orientation_and_classification(self, stub_orient, stub_classify):
+    def test_carries_orientation_and_classification(
+        self, stub_orient, stub_classify, disable_server_strategies
+    ):
         stub_orient(_orient(text_count=42, rotation=90, confidence=0.77))
         stub_classify(_classify(player="Jeter", team="Yankees", card_number="2"))
+        disable_server_strategies()
         result: CropResult = crop(image_bytes=_card_jpeg(), precropped_bytes=None)
         assert result.orientation.text_count == 42
         assert result.orientation.rotation_degrees == 90
-        assert result.classification.player == "Jeter"
+        assert result.classification.players == ["Jeter"]
         assert result.classification.card_number == "2"

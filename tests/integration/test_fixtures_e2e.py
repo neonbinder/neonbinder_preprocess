@@ -81,7 +81,8 @@ def test_fixture_end_to_end(case: FixtureCase):
     # known label and the b64 field is consistent with it.
     assert body["cropped_source"] in {
         "precropped",
-        "pil_trim",
+        "pil_trim_dark",
+        "pil_trim_light",
         "sam",
         "passthrough",
     }, f"{case.name}: unexpected cropped_source {body['cropped_source']!r}"

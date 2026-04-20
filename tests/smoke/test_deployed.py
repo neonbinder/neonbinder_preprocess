@@ -141,7 +141,8 @@ class TestProcessHappyPath:
         # precropped validator. cropped_image_b64 should be null in that case.
         assert body["cropped_source"] in {
             "precropped",
-            "pil_trim",
+            "pil_trim_dark",
+            "pil_trim_light",
             "passthrough",
         }, f"unexpected cropped_source {body['cropped_source']!r}"
         if body["cropped_source"] == "precropped":

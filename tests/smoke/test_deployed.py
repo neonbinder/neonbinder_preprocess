@@ -116,6 +116,7 @@ class TestProcessHappyPath:
         body = response.json()
 
         expected_keys = {
+            "players",
             "player",
             "team",
             "card_number",

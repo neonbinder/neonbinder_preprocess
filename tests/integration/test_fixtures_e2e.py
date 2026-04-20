@@ -55,6 +55,7 @@ def test_fixture_end_to_end(case: FixtureCase):
 
     # Shape assertions — every fixture, sidecar or not.
     assert set(body.keys()) == {
+        "players",
         "player",
         "team",
         "card_number",

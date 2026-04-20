@@ -33,14 +33,22 @@ ANTHROPIC_MAX_RAW_BYTES = 3_500_000
 DOWNSCALE_MAX_EDGE_PX = 1600
 DOWNSCALE_JPEG_QUALITY = 85
 
-PROMPT = """You are analyzing a trading card photo. Extract key fields as a strict JSON object
-with these keys:
-- "player": the main player or subject's name (string, or null if not visible)
-- "team": the team name if visible on the card, else null
-- "card_number": the card number as printed (e.g. "25", "RC-12"), string or null
-- "side": either "front" or "back"
+PROMPT = """You are analyzing a trading card photo. Return a SINGLE JSON OBJECT
+(not an array) with these keys:
+- "players": a JSON ARRAY of every player/subject name visible on the card.
+    Single-player cards: ["Ken Griffey Jr."]
+    Multi-player cards (leaders, combo, dual-rookie, team sets):
+      ["Salvador Perez", "Adam Duvall"]
+    No identifiable players: []
+- "team": the team name if visible on the card, else null. For multi-player
+    cards where players are on different teams, return null.
+- "card_number": the card number as printed (e.g. "25", "RC-12"), string
+    or null if not visible.
+- "side": either "front" or "back". Front has the player photo and name;
+    back has stats, copyright, career info, or team logos as tables.
 
-Respond with ONLY the JSON. No preamble, no code fences, no trailing text."""
+Respond with ONLY the JSON object. No array wrapper, no preamble, no code
+fences, no trailing text."""
 
 RETRY_PROMPT_SUFFIX = (
     "\n\nYour previous response could not be parsed as JSON. "
@@ -58,13 +66,21 @@ _MEDIA_TYPE_BY_PIL_FORMAT = {
 
 @dataclass(frozen=True)
 class ClassifyResult:
-    """Extracted card fields plus the model's raw response for debugging."""
+    """Extracted card fields plus the model's raw response for debugging.
 
-    player: str | None
+    `players` is the canonical list; `player` is a back-compat single-name
+    alias (first entry or None).
+    """
+
+    players: list[str]
     team: str | None
     card_number: str | None
     side: str
     raw_text: str
+
+    @property
+    def player(self) -> str | None:
+        return self.players[0] if self.players else None
 
 
 class ClassifyError(RuntimeError):
@@ -114,16 +130,75 @@ def _strip_code_fences(text: str) -> str:
     return stripped.strip()
 
 
-def _parse_response(text: str) -> dict:
+def _parse_response(text: str) -> object:
+    # Returns whatever json.loads produces: usually a dict, but Haiku
+    # occasionally wraps per-player objects in a top-level list. `_normalize`
+    # handles both shapes.
     return json.loads(_strip_code_fences(text))
 
 
-def _normalize(raw: dict, raw_text: str) -> ClassifyResult:
+def _merge_list_response(entries: list) -> dict:
+    """Collapse a list of per-entry dicts into our single-object shape.
+
+    Haiku's multi-player responses sometimes arrive as
+        [{"player": "A", ...}, {"player": "B", ...}]
+    one entry per person. We union the player names and take the first
+    non-null value seen for team/card_number/side.
+    """
+    players: list[str] = []
+    team: str | None = None
+    card_number: str | None = None
+    side: str | None = None
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        # Accept either "players" (new canonical) or "player" (legacy).
+        p = entry.get("players", entry.get("player"))
+        if isinstance(p, list):
+            players.extend(_nullable_str(x) or "" for x in p if _nullable_str(x))
+        else:
+            single = _nullable_str(p)
+            if single:
+                players.append(single)
+        if team is None:
+            team = _nullable_str(entry.get("team"))
+        if card_number is None:
+            card_number = _nullable_str(entry.get("card_number"))
+        if side is None:
+            s = str(entry.get("side", "")).lower()
+            if s in {"front", "back"}:
+                side = s
+
+    return {
+        "players": players,
+        "team": team,
+        "card_number": card_number,
+        "side": side,
+    }
+
+
+def _normalize(raw: object, raw_text: str) -> ClassifyResult:
+    if isinstance(raw, list):
+        raw = _merge_list_response(raw)
+    if not isinstance(raw, dict):
+        # A string/number at the top level; treat as unparseable — the
+        # retry path will ask the model for a stricter shape.
+        raise TypeError(f"expected JSON object, got {type(raw).__name__}")
+
+    players_raw = raw.get("players", raw.get("player"))
+    if isinstance(players_raw, list):
+        players = [p for p in (_nullable_str(x) for x in players_raw) if p]
+    else:
+        single = _nullable_str(players_raw)
+        players = [single] if single else []
+
     side = str(raw.get("side", "")).lower()
     if side not in {"front", "back"}:
         side = "front"
+
     return ClassifyResult(
-        player=_nullable_str(raw.get("player")),
+        players=players,
         team=_nullable_str(raw.get("team")),
         card_number=_nullable_str(raw.get("card_number")),
         side=side,

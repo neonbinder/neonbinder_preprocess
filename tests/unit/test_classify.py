@@ -208,6 +208,59 @@ class TestClassifyCard:
         image_block = call.kwargs["messages"][0]["content"][0]
         assert image_block["source"]["media_type"] == "image/png"
 
+    def test_multi_player_response_collects_players_list(self):
+        payload = (
+            '{"players":["Salvador Perez","Adam Duvall","Fernando Tatis"],'
+            '"team":null,"card_number":"68","side":"back"}'
+        )
+        client = _mock_client(_response_with_text(payload))
+
+        result = classify_card(_jpeg_bytes(), client=client)
+
+        assert result.players == ["Salvador Perez", "Adam Duvall", "Fernando Tatis"]
+        assert result.player == "Salvador Perez"  # back-compat property
+        assert result.team is None
+        assert result.card_number == "68"
+        assert result.side == "back"
+
+    def test_list_response_is_merged_not_crashed(self):
+        # Haiku occasionally wraps multi-player output in a top-level list.
+        # Previously this crashed _normalize with 'list has no attribute get'.
+        payload = (
+            "["
+            '{"player":"Ken Griffey Jr.","team":"Mariners","card_number":"24","side":"front"},'
+            '{"player":"Randy Johnson","team":"Mariners","card_number":"24","side":"front"}'
+            "]"
+        )
+        client = _mock_client(_response_with_text(payload))
+
+        result = classify_card(_jpeg_bytes(), client=client)
+
+        assert result.players == ["Ken Griffey Jr.", "Randy Johnson"]
+        assert result.team == "Mariners"
+        assert result.card_number == "24"
+        assert result.side == "front"
+
+    def test_legacy_player_string_still_works(self):
+        # Old single-player JSON shape remains parseable for back-compat.
+        payload = '{"player":"Ichiro","team":"Mariners","card_number":"51","side":"front"}'
+        client = _mock_client(_response_with_text(payload))
+
+        result = classify_card(_jpeg_bytes(), client=client)
+
+        assert result.players == ["Ichiro"]
+        assert result.player == "Ichiro"
+
+    def test_empty_players_list_accepted(self):
+        payload = '{"players":[],"team":null,"card_number":null,"side":"back"}'
+        client = _mock_client(_response_with_text(payload))
+
+        result = classify_card(_jpeg_bytes(), client=client)
+
+        assert result.players == []
+        assert result.player is None
+        assert result.side == "back"
+
     def test_uses_explicit_model_when_provided(self):
         payload = '{"player":null,"team":null,"card_number":null,"side":"front"}'
         client = _mock_client(_response_with_text(payload))

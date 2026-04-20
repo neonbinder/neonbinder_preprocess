@@ -55,6 +55,7 @@ def test_fixture_end_to_end(case: FixtureCase):
 
     # Shape assertions — every fixture, sidecar or not.
     assert set(body.keys()) == {
+        "players",
         "player",
         "team",
         "card_number",
@@ -81,6 +82,7 @@ def test_fixture_end_to_end(case: FixtureCase):
     assert body["cropped_source"] in {
         "precropped",
         "pil_trim",
+        "sam",
         "passthrough",
     }, f"{case.name}: unexpected cropped_source {body['cropped_source']!r}"
     if body["cropped_source"] == "precropped":

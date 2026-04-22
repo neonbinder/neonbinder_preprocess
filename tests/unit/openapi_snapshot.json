@@ -4,9 +4,16 @@
       "Body_process_process_post": {
         "properties": {
           "image": {
-            "format": "binary",
-            "title": "Image",
-            "type": "string"
+            "anyOf": [
+              {
+                "format": "binary",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image"
           },
           "precropped": {
             "anyOf": [
@@ -21,9 +28,6 @@
             "title": "Precropped"
           }
         },
-        "required": [
-          "image"
-        ],
         "title": "Body_process_process_post",
         "type": "object"
       },
@@ -195,6 +199,7 @@
     },
     "/process": {
       "post": {
+        "description": "Preprocess an image for card identification.\n\nThree request modes:\n  - **image-only** (unchanged default): `image` attached, no `precropped`.\n    Runs the full crop cascade on the original.\n  - **image + precropped** (unchanged opt-in): both attached. The\n    precropped is tried as the cascade's stage-1 candidate; if it's\n    rejected, the server falls back to its own crop strategies on the\n    original. Saves SAM/Haiku cost when the client crop is good; costs\n    full upload bandwidth regardless.\n  - **crop-only** (new): only `precropped` attached. Server validates the\n    crop and runs orient+classify on it if it passes. If validation\n    fails, returns `422 {\"error_code\":\"CROP_VALIDATION_FAILED\", ...,\n    \"retry_with_original\": true}` so the caller can retry with the\n    original. No silent server-side fallback \u2014 saving upload bandwidth\n    is the whole point.",
         "operationId": "process_process_post",
         "parameters": [
           {
@@ -221,8 +226,7 @@
                 "$ref": "#/components/schemas/Body_process_process_post"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "200": {

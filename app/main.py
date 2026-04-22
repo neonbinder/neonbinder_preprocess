@@ -17,10 +17,12 @@ import os
 from typing import Annotated
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app import cropper
 from app.classify import ClassifyError
+from app.cropper import CropRejected
 
 logger = logging.getLogger(__name__)
 
@@ -108,16 +110,47 @@ def health() -> dict[str, str]:
 
 @app.post("/process", response_model=ProcessResponse)
 async def process(
-    image: Annotated[UploadFile, File()],
+    image: Annotated[UploadFile | None, File()] = None,
     precropped: Annotated[UploadFile | None, File()] = None,
     x_internal_key: Annotated[str | None, Header()] = None,
-) -> ProcessResponse:
+) -> ProcessResponse | JSONResponse:
+    """Preprocess an image for card identification.
+
+    Three request modes:
+      - **image-only** (unchanged default): `image` attached, no `precropped`.
+        Runs the full crop cascade on the original.
+      - **image + precropped** (unchanged opt-in): both attached. The
+        precropped is tried as the cascade's stage-1 candidate; if it's
+        rejected, the server falls back to its own crop strategies on the
+        original. Saves SAM/Haiku cost when the client crop is good; costs
+        full upload bandwidth regardless.
+      - **crop-only** (new): only `precropped` attached. Server validates the
+        crop and runs orient+classify on it if it passes. If validation
+        fails, returns `422 {"error_code":"CROP_VALIDATION_FAILED", ...,
+        "retry_with_original": true}` so the caller can retry with the
+        original. No silent server-side fallback — saving upload bandwidth
+        is the whole point.
+    """
     _verify_internal_key(x_internal_key)
 
-    image_bytes = await _read_upload(image, field="image")
+    image_bytes: bytes | None = None
     precropped_bytes: bytes | None = None
+    if image is not None:
+        image_bytes = await _read_upload(image, field="image")
     if precropped is not None:
         precropped_bytes = await _read_upload(precropped, field="precropped")
+
+    if image_bytes is None and precropped_bytes is None:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error_code": "MISSING_IMAGE",
+                "detail": "at least one of image or precropped is required",
+            },
+        )
+
+    mode = _request_mode(image_bytes, precropped_bytes)
+    logger.info("process: mode=%s", mode)
 
     # The cascade handles orient + rotate + classify internally so every
     # crop strategy is evaluated through the same quality gates. Upstream
@@ -138,6 +171,22 @@ async def process(
             detail="preprocess pipeline upstream failure",
         ) from None
 
+    # Crop-only mode can reject the upload with a specific reason. The
+    # handler surfaces this as 422 with a structured body so callers can
+    # distinguish "crop no good, retry with original" from server errors.
+    if isinstance(result, CropRejected):
+        logger.info("process: mode=%s crop_rejected reason=%s", mode, result.reason)
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error_code": "CROP_VALIDATION_FAILED",
+                "reason": result.reason,
+                "retry_with_original": True,
+            },
+        )
+
+    logger.info("process: mode=%s source=%s", mode, result.source)
+
     cropped_image_b64: str | None = None
     if result.returned_bytes_differ:
         cropped_image_b64 = base64.b64encode(result.image_bytes).decode("ascii")
@@ -154,3 +203,17 @@ async def process(
         cropped_source=result.source,
         cropped_image_b64=cropped_image_b64,
     )
+
+
+def _request_mode(image_bytes: bytes | None, precropped_bytes: bytes | None) -> str:
+    """Single-word mode label for structured logging.
+
+    Matches the three-mode taxonomy in the crop-only plan; feeds Cloud
+    Logging dashboards so `mode=crop_only rejection_rate` is a
+    one-liner query.
+    """
+    if image_bytes is not None and precropped_bytes is not None:
+        return "image_and_crop"
+    if image_bytes is not None:
+        return "image_only"
+    return "crop_only"

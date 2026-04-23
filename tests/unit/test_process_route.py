@@ -131,12 +131,15 @@ class TestRequestValidation:
         )
         assert response.status_code == 413
 
-    def test_missing_file_field_returns_422(self):
+    def test_missing_file_field_returns_400_missing_image(self):
+        """With image+precropped both optional, an empty request is a
+        MISSING_IMAGE 400 rather than a FastAPI-level 422."""
         response = client.post(
             "/process",
             headers={"x-internal-key": "test-key"},
         )
-        assert response.status_code == 422
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "MISSING_IMAGE"
 
 
 class TestUpstreamFailures:
@@ -387,3 +390,132 @@ class TestPrecroppedField:
         import base64
 
         assert base64.b64decode(body["cropped_image_b64"]) == good_crop
+
+
+class TestCropOnlyMode:
+    """Crop-only mode: caller uploads only `precropped`, no `image`.
+
+    Cuts upload bandwidth (the dominant client-observed cost) by letting
+    callers skip the original when their client-side crop is good. On
+    validator reject the handler returns 422 with a specific error code
+    so the caller can retry with the original attached.
+    """
+
+    @staticmethod
+    def _card_bytes(size: tuple[int, int] = (500, 700)) -> bytes:
+        import random
+
+        rng = random.Random(size[0] + size[1])
+        raw = bytes(rng.randint(0, 255) for _ in range(size[0] * size[1] * 3))
+        out = io.BytesIO()
+        Image.frombytes("RGB", size, raw).save(out, format="JPEG", quality=85)
+        return out.getvalue()
+
+    def test_valid_crop_only_returns_200_precropped(self, monkeypatch):
+        _stub_orient(monkeypatch, rotation=0, confidence=0.9, text_count=12)
+        classify_inputs = _stub_classify(monkeypatch, player="Jeter", team="Yankees")
+
+        crop = self._card_bytes()
+        response = client.post(
+            "/process",
+            headers={"x-internal-key": "test-key"},
+            files={"precropped": ("crop.jpg", crop, "image/jpeg")},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["cropped_source"] == "precropped"
+        # Caller already has the bytes — never echo them back in crop-only mode.
+        assert body["cropped_image_b64"] is None
+        assert body["players"] == ["Jeter"]
+        assert body["team"] == "Yankees"
+        # Orient ran exactly once (on the crop) — crop-only skips the
+        # baseline-orient call the full cascade makes on the original.
+        assert len(classify_inputs) == 1
+
+    def test_too_small_crop_returns_422(self, monkeypatch):
+        _stub_orient(monkeypatch)
+        _stub_classify(monkeypatch)
+
+        response = client.post(
+            "/process",
+            headers={"x-internal-key": "test-key"},
+            files={
+                # 100x140 passes content-type but fails validator min-side=300.
+                "precropped": ("crop.jpg", _jpeg((100, 140)), "image/jpeg"),
+            },
+        )
+
+        assert response.status_code == 422
+        body = response.json()
+        assert body["error_code"] == "CROP_VALIDATION_FAILED"
+        assert body["retry_with_original"] is True
+        assert "too small" in body["reason"]
+
+    def test_wrong_aspect_crop_returns_422(self, monkeypatch):
+        _stub_orient(monkeypatch)
+        _stub_classify(monkeypatch)
+
+        response = client.post(
+            "/process",
+            headers={"x-internal-key": "test-key"},
+            files={
+                # Square 600x600 passes min-size but fails aspect tolerance.
+                "precropped": ("crop.jpg", self._card_bytes((600, 600)), "image/jpeg"),
+            },
+        )
+
+        assert response.status_code == 422
+        body = response.json()
+        assert body["error_code"] == "CROP_VALIDATION_FAILED"
+        assert "aspect" in body["reason"]
+
+    def test_insufficient_text_returns_422(self, monkeypatch):
+        # Geometry is fine, but Vision returns text_count=0 → treat as not-a-card.
+        _stub_orient(monkeypatch, text_count=0)
+        _stub_classify(monkeypatch)
+
+        response = client.post(
+            "/process",
+            headers={"x-internal-key": "test-key"},
+            files={"precropped": ("crop.jpg", self._card_bytes(), "image/jpeg")},
+        )
+
+        assert response.status_code == 422
+        body = response.json()
+        assert body["error_code"] == "CROP_VALIDATION_FAILED"
+        assert body["reason"] == "insufficient_text"
+
+    def test_missing_both_fields_returns_400_missing_image(self):
+        response = client.post(
+            "/process",
+            headers={"x-internal-key": "test-key"},
+            data={"dummy": "ignored"},  # forces a multipart body without files
+        )
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error_code"] == "MISSING_IMAGE"
+
+    def test_crop_only_wrong_content_type_returns_415(self, monkeypatch):
+        _stub_orient(monkeypatch)
+        _stub_classify(monkeypatch)
+
+        response = client.post(
+            "/process",
+            headers={"x-internal-key": "test-key"},
+            files={"precropped": ("crop.txt", b"not an image", "text/plain")},
+        )
+        assert response.status_code == 415
+        assert "precropped" in response.json()["detail"]
+
+    def test_crop_only_empty_returns_400(self, monkeypatch):
+        _stub_orient(monkeypatch)
+        _stub_classify(monkeypatch)
+
+        response = client.post(
+            "/process",
+            headers={"x-internal-key": "test-key"},
+            files={"precropped": ("crop.jpg", b"", "image/jpeg")},
+        )
+        assert response.status_code == 400
+        assert "empty precropped" in response.json()["detail"]

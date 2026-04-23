@@ -19,7 +19,7 @@ from PIL import Image
 
 from app import cropper
 from app.classify import ClassifyResult
-from app.cropper import CropResult, crop
+from app.cropper import CropRejected, CropResult, crop
 from app.orient import OrientationResult
 
 
@@ -387,6 +387,97 @@ class TestPassthroughFallback:
         assert result.classification.players == []
         assert result.classification.card_number is None
         assert result.classification.side == "back"
+
+
+class TestCropOnlyMode:
+    """Crop-only mode: caller provides only `precropped_bytes`, no original.
+
+    The cascade has no fallback path here — it either returns a normal
+    CropResult (crop passed the adapted two-gate check) or a CropRejected
+    with a specific reason so main.py can surface a 422.
+    """
+
+    def test_valid_crop_returns_crop_result(self, stub_orient, stub_classify):
+        stub_orient()
+        stub_classify(_classify())
+
+        crop_bytes = _card_jpeg(size=(500, 700))
+        result = crop(image_bytes=None, precropped_bytes=crop_bytes)
+
+        assert isinstance(result, CropResult)
+        assert result.source == "precropped"
+        assert result.image_bytes == crop_bytes
+        assert result.returned_bytes_differ is False
+        assert result.classification.players == ["Ichiro"]
+
+    def test_too_small_crop_rejected(self, stub_orient, stub_classify):
+        # Orient/classify stubs set but shouldn't be reached on validator reject.
+        orient_calls = stub_orient()
+        classify_calls = stub_classify(_classify())
+
+        tiny = _card_jpeg(size=(100, 140))
+        result = crop(image_bytes=None, precropped_bytes=tiny)
+
+        assert isinstance(result, CropRejected)
+        assert "too small" in result.reason
+        assert orient_calls == []  # no orient on a validator-rejected crop
+        assert classify_calls == []
+
+    def test_wrong_aspect_rejected(self, stub_orient, stub_classify):
+        stub_orient()
+        stub_classify(_classify())
+
+        square = _card_jpeg(size=(600, 600))
+        result = crop(image_bytes=None, precropped_bytes=square)
+
+        assert isinstance(result, CropRejected)
+        assert "aspect" in result.reason
+
+    def test_insufficient_text_rejected(self, stub_orient, stub_classify):
+        # Crop passes geometry but Vision finds no text — treat as not-a-card.
+        stub_orient(_orient(text_count=0))
+        classify_calls = stub_classify(_classify())
+
+        crop_bytes = _card_jpeg(size=(500, 700))
+        result = crop(image_bytes=None, precropped_bytes=crop_bytes)
+
+        assert isinstance(result, CropRejected)
+        assert result.reason == "insufficient_text"
+        # classify must not run when the crop is rejected upstream
+        assert classify_calls == []
+
+    def test_blank_image_rejected(self, stub_orient, stub_classify):
+        stub_orient()
+        stub_classify(_classify())
+
+        # Solid white passes geometry but fails the stddev check.
+        buf = io.BytesIO()
+        Image.new("RGB", (500, 700), color="white").save(buf, format="JPEG")
+        blank = buf.getvalue()
+
+        result = crop(image_bytes=None, precropped_bytes=blank)
+
+        assert isinstance(result, CropRejected)
+        assert "near-uniform" in result.reason
+
+    def test_both_none_raises(self):
+        with pytest.raises(ValueError, match="at least one"):
+            crop(image_bytes=None, precropped_bytes=None)
+
+    def test_rotation_applied_before_classify(self, stub_orient, stub_classify):
+        # Sanity: crop-only path still rotates the crop before classify.
+        stub_orient(_orient(rotation=90))
+        classify_calls = stub_classify(_classify())
+
+        # Valid card-ratio crop so it passes validator.
+        crop_bytes = _card_jpeg(size=(500, 700))
+        result = crop(image_bytes=None, precropped_bytes=crop_bytes)
+
+        assert isinstance(result, CropResult)
+        assert len(classify_calls) == 1
+        # After CCW-90, the 500x700 crop should be seen by classify as 700x500.
+        with Image.open(io.BytesIO(classify_calls[0])) as rotated:
+            assert rotated.size == (700, 500)
 
 
 class TestCropResultShape:

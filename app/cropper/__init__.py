@@ -54,6 +54,14 @@ logger = logging.getLogger(__name__)
 # similar crops without letting a wrong-region crop slip through.
 MIN_CASCADE_TEXT_RATIO = 0.8
 
+# In crop-only mode (no original uploaded) there's no baseline to regress
+# from, so the text-count gate becomes an absolute floor: Vision must find
+# at least this many text tokens on the crop for it to be considered a card.
+# 1 is enough to distinguish blank/scenery images from cards while staying
+# permissive enough that legitimate low-text crops (e.g. backs of early
+# cards) still pass.
+MIN_ABSOLUTE_TEXT_COUNT = 1
+
 # Type for a crop strategy: takes raw image bytes, returns cropped bytes or None.
 CropStrategy = Callable[[bytes], bytes | None]
 
@@ -88,6 +96,20 @@ class CropResult:
     returned_bytes_differ: bool
     orientation: OrientationResult
     classification: ClassifyResult
+
+
+@dataclass(frozen=True)
+class CropRejected:
+    """Crop-only-mode outcome when the supplied crop fails validation.
+
+    Only produced by the crop-only code path (no `image_bytes` uploaded).
+    The handler translates this into a 422 response with a specific error
+    code so the caller knows to retry with the original image attached.
+    `reason` mirrors `ValidationResult.reason` or `"insufficient_text"`
+    from the absolute text-count floor.
+    """
+
+    reason: str
 
 
 def _try_stage(
@@ -130,21 +152,80 @@ def _try_stage(
     )
 
 
+def _try_precropped_only(precropped_bytes: bytes) -> CropResult | CropRejected:
+    """Crop-only mode: caller supplied only a crop, no original.
+
+    Two gates still apply, adapted to the missing-original constraint:
+      1. Geometry + blank-image (validator.is_plausible_crop with
+         source_area_bytes=None — area-fraction is skipped since there's
+         no source to compare against).
+      2. Absolute text-count floor (MIN_ABSOLUTE_TEXT_COUNT) in place of the
+         regression guard, since there's no baseline to regress from.
+
+    On failure returns CropRejected so the handler can surface a specific
+    4xx and the caller knows to retry with the original. On success runs
+    orient → rotate → classify on the crop and returns a normal CropResult
+    with source="precropped".
+    """
+    check = is_plausible_crop(precropped_bytes, source_area_bytes=None)
+    if not check.ok:
+        logger.info("crop_only: rejected by validator (%s)", check.reason)
+        return CropRejected(reason=check.reason or "validator_failed")
+
+    orient = detect_orientation(precropped_bytes)
+    if orient.text_count < MIN_ABSOLUTE_TEXT_COUNT:
+        logger.info(
+            "crop_only: text_count=%d below absolute floor=%d",
+            orient.text_count,
+            MIN_ABSOLUTE_TEXT_COUNT,
+        )
+        return CropRejected(reason="insufficient_text")
+
+    rotated = rotate_image_bytes(precropped_bytes, orient.rotation_degrees)
+    classification = classify_card(rotated)
+
+    return CropResult(
+        image_bytes=precropped_bytes,
+        source="precropped",
+        returned_bytes_differ=False,
+        orientation=orient,
+        classification=classification,
+    )
+
+
 def crop(
     *,
-    image_bytes: bytes,
+    image_bytes: bytes | None,
     precropped_bytes: bytes | None,
-) -> CropResult:
+) -> CropResult | CropRejected:
     """Run the crop cascade and return the winning result.
 
-    When `precropped_bytes` is provided, that's tried first via `_try_stage`.
-    When absent, the `image` upload is used as the stage-1 candidate (slice-1
-    backward compat for callers who already cropped client-side).
+    Three input modes:
+      - image-only: `image_bytes` set, `precropped_bytes` None → full cascade.
+      - image+precropped: both set → cascade with precropped as stage 1,
+        falls back to server strategies on the original if it's rejected.
+      - **crop-only**: `image_bytes` None, `precropped_bytes` set → validate
+        crop, run orient/classify on it, return CropResult or CropRejected.
+        No fallback path — handler translates CropRejected to 422.
+
+    When `precropped_bytes` is provided alongside `image_bytes`, that's tried
+    first via `_try_stage`. When only `image_bytes` is present, it's used as
+    the stage-1 candidate (slice-1 backward compat for callers who already
+    cropped client-side).
 
     The baseline orient on `image_bytes` is computed up front — one extra
     Vision call relative to the old precropped-short-circuit path — so the
     text-count gate applies uniformly to every stage, including precropped.
     """
+    # ── Crop-only mode ─────────────────────────────────────────────────
+    # Caller opted into the "don't upload the original" fast path. No
+    # fallback cascade is available; reject with a specific reason if
+    # the crop doesn't pass the adapted two-gate check.
+    if image_bytes is None:
+        if precropped_bytes is None:
+            raise ValueError("crop() requires at least one of image_bytes or precropped_bytes")
+        return _try_precropped_only(precropped_bytes)
+
     # ── Baseline — used for the text-count threshold AND as the passthrough
     # fallback orient. Computed once, reused throughout.
     baseline_orient = detect_orientation(image_bytes)

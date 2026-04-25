@@ -80,6 +80,110 @@ _STRATEGIES: list[tuple[str, object, str]] = [
     ("haiku_bbox", haiku_bbox, "haiku_bbox_crop"),
 ]
 
+# Public, ordered tuple of strategy names. Both the cascade and the
+# /crop endpoint walk this — single source of truth for ordering.
+STRATEGY_NAMES: tuple[str, ...] = tuple(name for name, _module, _attr in _STRATEGIES)
+
+
+class UnknownStrategyError(ValueError):
+    """Raised when a strategy identifier (name or index) doesn't resolve."""
+
+
+def resolve_strategy_identifier(identifier: str | int) -> str:
+    """Resolve a strategy name or 0-based index to its canonical name.
+
+    Accepts:
+      - a strategy name string (e.g. "sam") — returned as-is if valid
+      - an int index into STRATEGY_NAMES (e.g. 2)
+      - a numeric string interpreted as an index (e.g. "2")
+
+    Raises UnknownStrategyError on unknown name, out-of-range index,
+    negative index, or non-numeric junk.
+    """
+    if isinstance(identifier, bool):  # bool is an int subclass — exclude it
+        raise UnknownStrategyError(
+            f"invalid strategy identifier: {identifier!r}; "
+            f"valid names: {list(STRATEGY_NAMES)}"
+        )
+    if isinstance(identifier, int):
+        if 0 <= identifier < len(STRATEGY_NAMES):
+            return STRATEGY_NAMES[identifier]
+        raise UnknownStrategyError(
+            f"strategy index {identifier} out of range; "
+            f"valid indices: 0..{len(STRATEGY_NAMES) - 1}"
+        )
+    if isinstance(identifier, str):
+        if identifier in STRATEGY_NAMES:
+            return identifier
+        # Numeric string → index
+        stripped = identifier.strip()
+        if stripped.lstrip("-").isdigit():
+            try:
+                idx = int(stripped)
+            except ValueError:
+                pass
+            else:
+                if 0 <= idx < len(STRATEGY_NAMES):
+                    return STRATEGY_NAMES[idx]
+                raise UnknownStrategyError(
+                    f"strategy index {idx} out of range; "
+                    f"valid indices: 0..{len(STRATEGY_NAMES) - 1}"
+                )
+        raise UnknownStrategyError(
+            f"unknown strategy {identifier!r}; valid names: {list(STRATEGY_NAMES)}"
+        )
+    raise UnknownStrategyError(
+        f"invalid strategy identifier type: {type(identifier).__name__}"
+    )
+
+
+def _strategy_callable(name: str) -> CropStrategy:
+    """Look up the strategy callable fresh on every call.
+
+    Tests rely on monkey-patching the module attribute (e.g.
+    `monkeypatch.setattr(cropper.sam, "sam_crop", ...)`) and expect the
+    cascade to pick up the patch, so we resolve via `getattr` here rather
+    than capturing the function object at import time.
+    """
+    for entry_name, module, attr in _STRATEGIES:
+        if entry_name == name:
+            return getattr(module, attr)  # type: ignore[no-any-return]
+    raise UnknownStrategyError(
+        f"unknown strategy {name!r}; valid names: {list(STRATEGY_NAMES)}"
+    )
+
+
+def run_strategy_capturing(
+    name: str, image_bytes: bytes
+) -> tuple[bytes | None, str | None]:
+    """Run a single strategy, capturing exceptions as a class-name string.
+
+    Returns `(produced_bytes, error_class_name)`:
+      - success → (bytes, None)
+      - strategy returned None → (None, None)
+      - strategy raised → (None, "<ExcClass>"); a warning is logged
+
+    Lets `/crop` distinguish "ran cleanly, found nothing" from "crashed".
+    """
+    fn = _strategy_callable(name)
+    try:
+        produced = fn(image_bytes)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("strategy %s raised %s", name, exc)
+        return None, type(exc).__name__
+    return produced, None
+
+
+def run_strategy(name: str, image_bytes: bytes) -> bytes | None:
+    """Run a single strategy. Cascade-flavored: errors are swallowed to None.
+
+    Thin wrapper over `run_strategy_capturing` that throws away the error
+    name. This is the primitive the cascade loop uses; the /crop endpoint
+    calls `run_strategy_capturing` directly so it can surface crashes.
+    """
+    produced, _err = run_strategy_capturing(name, image_bytes)
+    return produced
+
 
 @dataclass(frozen=True)
 class CropResult:
@@ -251,13 +355,8 @@ def crop(
         return result
 
     # ── Stages 2..N — server-side croppers through the same uniform gate.
-    for source, module, fn_name in _STRATEGIES:
-        strategy_fn: CropStrategy = getattr(module, fn_name)
-        try:
-            produced = strategy_fn(image_bytes)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("cascade: %s raised %s", source, exc)
-            continue
+    for source in STRATEGY_NAMES:
+        produced = run_strategy(source, image_bytes)
         if produced is None:
             continue
 

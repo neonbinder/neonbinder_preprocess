@@ -102,8 +102,7 @@ def resolve_strategy_identifier(identifier: str | int) -> str:
     """
     if isinstance(identifier, bool):  # bool is an int subclass — exclude it
         raise UnknownStrategyError(
-            f"invalid strategy identifier: {identifier!r}; "
-            f"valid names: {list(STRATEGY_NAMES)}"
+            f"invalid strategy identifier: {identifier!r}; " f"valid names: {list(STRATEGY_NAMES)}"
         )
     if isinstance(identifier, int):
         if 0 <= identifier < len(STRATEGY_NAMES):
@@ -132,9 +131,7 @@ def resolve_strategy_identifier(identifier: str | int) -> str:
         raise UnknownStrategyError(
             f"unknown strategy {identifier!r}; valid names: {list(STRATEGY_NAMES)}"
         )
-    raise UnknownStrategyError(
-        f"invalid strategy identifier type: {type(identifier).__name__}"
-    )
+    raise UnknownStrategyError(f"invalid strategy identifier type: {type(identifier).__name__}")
 
 
 def _strategy_callable(name: str) -> CropStrategy:
@@ -148,14 +145,10 @@ def _strategy_callable(name: str) -> CropStrategy:
     for entry_name, module, attr in _STRATEGIES:
         if entry_name == name:
             return getattr(module, attr)  # type: ignore[no-any-return]
-    raise UnknownStrategyError(
-        f"unknown strategy {name!r}; valid names: {list(STRATEGY_NAMES)}"
-    )
+    raise UnknownStrategyError(f"unknown strategy {name!r}; valid names: {list(STRATEGY_NAMES)}")
 
 
-def run_strategy_capturing(
-    name: str, image_bytes: bytes
-) -> tuple[bytes | None, str | None]:
+def run_strategy_capturing(name: str, image_bytes: bytes) -> tuple[bytes | None, str | None]:
     """Run a single strategy, capturing exceptions as a class-name string.
 
     Returns `(produced_bytes, error_class_name)`:

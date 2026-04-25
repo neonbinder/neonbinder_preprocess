@@ -94,8 +94,7 @@ class TestRunStrategy:
         # Logger formats with %s — check the rendered message includes the
         # strategy name and the exception's str() output.
         assert any(
-            "sam" in rec.getMessage() and "kaboom" in rec.getMessage()
-            for rec in caplog.records
+            "sam" in rec.getMessage() and "kaboom" in rec.getMessage() for rec in caplog.records
         )
 
     def test_unknown_name_raises(self):

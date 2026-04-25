@@ -16,13 +16,13 @@ import logging
 import os
 from typing import Annotated
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app import cropper
 from app.classify import ClassifyError
-from app.cropper import CropRejected
+from app.cropper import STRATEGY_NAMES, CropRejected, UnknownStrategyError
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,35 @@ app = FastAPI(title="neonbinder-preprocess", version="0.3.0")
 INTERNAL_API_KEY_ENV = "INTERNAL_API_KEY"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 ALLOWED_CONTENT_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+
+
+class CropStrategyOutput(BaseModel):
+    """One strategy's output in a /crop response.
+
+    `image_b64` is null when the strategy returned None (ran cleanly but
+    couldn't produce a crop) OR when it raised. The two cases are
+    distinguished by `error`: null means "ran cleanly, no crop"; a string
+    is the exception class name. Crashes do NOT 5xx the endpoint — the
+    whole point of /crop is letting the human pick from whatever
+    succeeded, even when one strategy is broken.
+    """
+
+    strategy: str
+    index: int
+    image_b64: str | None
+    error: str | None
+
+
+class CropResponse(BaseModel):
+    """Response body for POST /crop.
+
+    `crops` is a list with one entry per strategy that was run:
+      - one entry when `strategy` was supplied
+      - len(STRATEGY_NAMES) entries when it was omitted
+    Order matches `cropper.STRATEGY_NAMES` (the canonical cascade order).
+    """
+
+    crops: list[CropStrategyOutput]
 
 
 class ProcessResponse(BaseModel):
@@ -217,3 +246,65 @@ def _request_mode(image_bytes: bytes | None, precropped_bytes: bytes | None) -> 
     if image_bytes is not None:
         return "image_only"
     return "crop_only"
+
+
+@app.post("/crop", response_model=CropResponse)
+async def crop_alternatives(
+    image: Annotated[UploadFile, File()],
+    strategy: Annotated[str | None, Form()] = None,
+    x_internal_key: Annotated[str | None, Header()] = None,
+) -> CropResponse | JSONResponse:
+    """Run one or all crop strategies on an uploaded image and return raw crops.
+
+    Companion to `/process`: when the cascade's "best" pick looks wrong to
+    a human, this endpoint surfaces the alternatives. No orient, no
+    classify, no gates — just raw cropped bytes per strategy so a human
+    can pick a different one. If they pick one, they re-POST it to
+    `/process` as `precropped` to get the full pipeline.
+
+    Strategy identifier (form field):
+      - omitted → run every strategy in cascade order
+      - name (e.g. `sam`) → run just that one
+      - 0-based index as a numeric string (e.g. `2`) → run just that one
+    """
+    _verify_internal_key(x_internal_key)
+
+    image_bytes = await _read_upload(image, field="image")
+
+    if strategy is not None:
+        try:
+            resolved = cropper.resolve_strategy_identifier(strategy)
+        except UnknownStrategyError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "error_code": "UNKNOWN_STRATEGY",
+                    "detail": str(exc),
+                    "valid": list(STRATEGY_NAMES),
+                },
+            )
+        names: tuple[str, ...] = (resolved,)
+    else:
+        names = STRATEGY_NAMES
+
+    crops: list[CropStrategyOutput] = []
+    for name in names:
+        produced, error = cropper.run_strategy_capturing(name, image_bytes)
+        image_b64 = base64.b64encode(produced).decode("ascii") if produced else None
+        crops.append(
+            CropStrategyOutput(
+                strategy=name,
+                index=STRATEGY_NAMES.index(name),
+                image_b64=image_b64,
+                error=error,
+            )
+        )
+
+    logger.info(
+        "crop: ran=%d produced=%d crashed=%d",
+        len(crops),
+        sum(1 for c in crops if c.image_b64 is not None),
+        sum(1 for c in crops if c.error is not None),
+    )
+
+    return CropResponse(crops=crops)

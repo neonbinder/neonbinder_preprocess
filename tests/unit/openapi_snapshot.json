@@ -1,6 +1,31 @@
 {
   "components": {
     "schemas": {
+      "Body_crop_alternatives_crop_post": {
+        "properties": {
+          "image": {
+            "format": "binary",
+            "title": "Image",
+            "type": "string"
+          },
+          "strategy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Strategy"
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "title": "Body_crop_alternatives_crop_post",
+        "type": "object"
+      },
       "Body_process_process_post": {
         "properties": {
           "image": {
@@ -29,6 +54,66 @@
           }
         },
         "title": "Body_process_process_post",
+        "type": "object"
+      },
+      "CropResponse": {
+        "description": "Response body for POST /crop.\n\n`crops` is a list with one entry per strategy that was run:\n  - one entry when `strategy` was supplied\n  - len(STRATEGY_NAMES) entries when it was omitted\nOrder matches `cropper.STRATEGY_NAMES` (the canonical cascade order).",
+        "properties": {
+          "crops": {
+            "items": {
+              "$ref": "#/components/schemas/CropStrategyOutput"
+            },
+            "title": "Crops",
+            "type": "array"
+          }
+        },
+        "required": [
+          "crops"
+        ],
+        "title": "CropResponse",
+        "type": "object"
+      },
+      "CropStrategyOutput": {
+        "description": "One strategy's output in a /crop response.\n\n`image_b64` is null when the strategy returned None (ran cleanly but\ncouldn't produce a crop) OR when it raised. The two cases are\ndistinguished by `error`: null means \"ran cleanly, no crop\"; a string\nis the exception class name. Crashes do NOT 5xx the endpoint \u2014 the\nwhole point of /crop is letting the human pick from whatever\nsucceeded, even when one strategy is broken.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "image_b64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image B64"
+          },
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "strategy": {
+            "title": "Strategy",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy",
+          "index",
+          "image_b64",
+          "error"
+        ],
+        "title": "CropStrategyOutput",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -175,6 +260,63 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/crop": {
+      "post": {
+        "description": "Run one or all crop strategies on an uploaded image and return raw crops.\n\nCompanion to `/process`: when the cascade's \"best\" pick looks wrong to\na human, this endpoint surfaces the alternatives. No orient, no\nclassify, no gates \u2014 just raw cropped bytes per strategy so a human\ncan pick a different one. If they pick one, they re-POST it to\n`/process` as `precropped` to get the full pipeline.\n\nStrategy identifier (form field):\n  - omitted \u2192 run every strategy in cascade order\n  - name (e.g. `sam`) \u2192 run just that one\n  - 0-based index as a numeric string (e.g. `2`) \u2192 run just that one",
+        "operationId": "crop_alternatives_crop_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-internal-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Internal-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_crop_alternatives_crop_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CropResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Crop Alternatives"
+      }
+    },
     "/health": {
       "get": {
         "operationId": "health_health_get",

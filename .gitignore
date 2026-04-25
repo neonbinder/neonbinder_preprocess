@@ -20,3 +20,8 @@ tests/fixtures/*.jpg
 tests/fixtures/*.jpeg
 tests/fixtures/*.png
 tests/fixtures/*.webp
+
+# Local convenience scripts for tailing Cloud Run logs — not part of the
+# committed toolchain.
+scripts/logs.sh
+scripts/logs-tail.sh

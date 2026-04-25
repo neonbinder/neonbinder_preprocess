@@ -16,7 +16,6 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app import cropper
 from app.cropper import STRATEGY_NAMES
 from app.main import MAX_IMAGE_BYTES, app
 

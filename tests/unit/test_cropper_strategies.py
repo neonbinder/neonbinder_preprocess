@@ -117,13 +117,13 @@ class TestRunStrategyCapturing:
         assert err is None  # critical: ran cleanly, just produced nothing
 
     def test_exception_returns_none_bytes_and_class_name(self, monkeypatch):
-        class CustomBoom(RuntimeError):
+        class CustomBoomError(RuntimeError):
             pass
 
         def _boom(_b):
-            raise CustomBoom("nope")
+            raise CustomBoomError("nope")
 
         monkeypatch.setattr("app.cropper.haiku_bbox.haiku_bbox_crop", _boom)
         produced, err = run_strategy_capturing("haiku_bbox", b"in")
         assert produced is None
-        assert err == "CustomBoom"
+        assert err == "CustomBoomError"
